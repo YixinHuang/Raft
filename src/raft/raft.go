@@ -1,5 +1,9 @@
 package raft
 
+// Version: 0.1
+// Date:2020/4/2
+// Memo:
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -68,22 +72,33 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	//Persistent state on all server
+	//============================State==========================================
+	//Persistent state on all server：(Updated on stable storage before responding to RPCs)
 	currentTerm int                   //latest term server has seen.(initialized to 0 on first boot,increases monotonically)
 	votedFor    int                   //CandidateId that reveived vore in current term (or null if none)
-	logs        []map[int]interface{} // log entries;each entry contains command for state machine and term when entry was received by leader
+	logs        []map[int]interface{} //log entries;each entry contains command for state machine and term when entry was received by leader
 
-	//Volatile state on all expectedServers
+	//Volatile state on all Servers：
 	commitIndex int //index of highest log entry known to be committed(initialized to 0, increases monotonically)
-	lastApplied int //index of highest log entry applied to state machine (initialized to 0,increases monotonically)
+	//A log entry is committed once the leader that created the entry has replicated it on a majority of the servers
 
-	//Volatile state on leaders:
+	lastApplied int //index of highest log entry applied to state machine (initialized to 0,increases monotonically)
+	//Rules for all servers:If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3) TBC
+
+	//Volatile state on leaders:(Reinitialized after election)
 	nextIndex  []int //for each server, index of the next log entry to send to that server(initialized to leader last log index +1)
 	matchIndex []int //for each server,index of highest entry known to be replicated on server(initialized to 0,increases monotonically)
+	//===========================================================================
 
 	//internal value declare here
-	nodeState     RaftNodeState
-	electionTimer time.Duration
+	nodeState RaftNodeState
+
+	//Raft’s RPCs typically require the recipient to persist information to stable storage,
+	//so the broadcast time may range from 0.5ms to 20ms, depending on storage technology.
+	//As a result, the election timeout is likely to be somewhere between 10ms and 500ms.
+	//broadcastTime ≪ electionTimeout ≪ MTBF
+	electionTimeout  time.Duration
+	heartbeatTimeout time.Duration
 
 	//temp values
 	reStartHeartBeat bool
@@ -127,16 +142,28 @@ func (rf *Raft) GetNodeState() string {
 	}
 }
 
-func (rf *Raft) SetElectionTimer(enableTimer bool) {
+func (rf *Raft) SetElectionTimeout(enableTimer bool) {
 	if enableTimer {
 		rand.Seed(time.Now().Unix() + int64(rf.me))
-		rf.electionTimer = time.Duration(1000-rand.Intn(300)) * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
-		DPrintf("[SetElectionTimer@raft.go][%d] Enable rf.SetElectionTimer:= [%v]", rf.me, rf.electionTimer)
+		rf.electionTimeout = time.Duration(1000-rand.Intn(300)) * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
+		DPrintf("[SetElectionTimeout@raft.go][%d] Enable rf.ectionTimeout:= [%v]", rf.me, rf.electionTimeout)
 	} else {
-		rf.electionTimer = -1
-		DPrintf("[SetElectionTimer@raft.go][%d] Disable ElectionTimer", rf.me)
+		rf.electionTimeout = -1
+		DPrintf("[SetElectionTimeout@raft.go][%d] Disable electionTimeout", rf.me)
 	}
 
+}
+
+func (rf *Raft) SetHeartBeatTimeout(enableTimer bool) {
+	if enableTimer {
+		rand.Seed(time.Now().Unix() + int64(rf.me))
+		//rf.heartbeatTimeout = time.Duration(1000-rand.Intn(300)) * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
+		rf.heartbeatTimeout = 100 * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
+		DPrintf("[SetHeartBeatTimeout@raft.go][%d] Enable rf.ectionTimeout:= [%v]", rf.me, rf.electionTimeout)
+	} else {
+		rf.heartbeatTimeout = -1
+		DPrintf("[SetHeartBeatTimeout@raft.go][%d] Disable electionTimeout", rf.me)
+	}
 }
 
 func (rf *Raft) DumpRaft() {
@@ -150,7 +177,8 @@ func (rf *Raft) DumpRaft() {
 	DPrintf("[DumpRaft@raft.go] rf.votedFor := [%d]", rf.votedFor)
 	DPrintf("[DumpRaft@raft.go] rf.commitIndex := [%d]", rf.commitIndex)
 	DPrintf("[DumpRaft@raft.go] rf.lastApplied := [%d]", rf.lastApplied)
-	DPrintf("[DumpRaft@raft.go] rf.electionTimer := [%v]", rf.electionTimer)
+	DPrintf("[DumpRaft@raft.go] rf.electionTimeout := [%v]", rf.electionTimeout)
+	DPrintf("[DumpRaft@raft.go] rf.heartbeatTimeout := [%v]", rf.heartbeatTimeout)
 	DPrintf("[DumpRaft@raft.go] rf.reStartHeartBeat := [%t]", rf.reStartHeartBeat)
 
 	for i, curPeer := range rf.peers {
@@ -237,6 +265,8 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
+//============================RequestVote RPC==================================
+
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -270,6 +300,12 @@ func (reply *RequestVoteReply) DumpRequestVoteReply() {
 //
 // example RequestVote RPC handler.
 //
+//-----------------------------------------------------------------------------
+//Receiver implementation:
+//1. Reply false if term < currentTerm (§5.1)
+//2. If votedFor is null or candidateId, and candidate’s log is at least as up-to-date
+//	 as receiver’s log, grant vote (§5.2, §5.4)
+//-----------------------------------------------------------------------------
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	DPrintf("[RequestVoteHandler@raft.go][%d][%s] RequestVote() Entry", rf.me, rf.GetNodeState())
@@ -349,6 +385,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+//============================AppendEntries RPC================================
 //
 // example AppendEntries RPC arguments structure.
 // field names must start with capital letters!
@@ -384,23 +421,33 @@ func (reply *AppendEntriesReply) DumpAppendEntriesReply() {
 //
 // example AppendEntries RPC handler.
 //
+//-----------------------------------------------------------------------------
+//Receiver implementation:
+//1. Reply false if term < currentTerm (§5.1)
+//2. Reply false if log doesn’t contain an entry at prevLogIndex whose term matches prevLogTerm (§5.3)
+//3. If an existing entry conflicts with a new one (same index but different terms), delete the existing entry and all that follow it (§5.3)
+//4. Append any new entries not already in the log
+//5. If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
+//-----------------------------------------------------------------------------
+
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
-	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] RequestVote() Entry", rf.me, rf.GetNodeState())
+	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntries() Entry", rf.me, rf.GetNodeState())
 	//set return value
 	reply.Term = rf.currentTerm
 	reply.Success = true
+
 	rf.reStartHeartBeat = true
 
-	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] RequestVote() Exit", rf.me, rf.GetNodeState())
+	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntries() Exit", rf.me, rf.GetNodeState())
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("[sendAppendEntries@raft.go][%d] sendRequestVote() Entry", rf.me)
+	DPrintf("[sendAppendEntries@raft.go][%d] sendAppendEntries() Entry", rf.me)
 	args.DumpAppendEntriesArgs()
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	reply.DumpAppendEntriesReply()
-	DPrintf("[sendAppendEntries@raft.go][%d] sendRequestVote() Exit", rf.me)
+	DPrintf("[sendAppendEntries@raft.go][%d] sendAppendEntries() Exit", rf.me)
 	return ok
 }
 
@@ -508,26 +555,30 @@ func (rf *Raft) kickoff() {
 	defer hearBeatTicker.Stop()
 
 	//const RaftElectionTimeout = 1000 * time.Millisecond
-	rf.SetElectionTimer(true)
-	DPrintf("[kickoff@raft.go][%d]Start a election timer:[%v]", rf.me, rf.electionTimer)
-	electionticker := time.NewTicker(rf.electionTimer)
+	rf.SetElectionTimeout(true)
+	DPrintf("[kickoff@raft.go][%d]Start a election timer:[%v]", rf.me, rf.electionTimeout)
+	electionticker := time.NewTicker(rf.electionTimeout)
 	defer electionticker.Stop()
 
 	for {
 		select {
 		case <-hearBeatTicker.C:
+			DPrintf("[kickoff@raft.go][%d]HearBeatTicker timeout", rf.me)
 			if rf.reStartHeartBeat {
 				DPrintf("[kickoff@raft.go][%d]Break form hearBeatTicker ,bacause  reStartHeartBeat is true", rf.me)
 				break
 			}
-			DPrintf("[kickoff@raft.go][%d]HearBeatTicker timeout", rf.me)
+
+			go func() {
+				rf.SendAppendEntries2All()
+			}()
 			//Figure 4: Server states. Followers only respond to requests from other servers.
 			//If a follower receives no communication, it becomes a candidate and initiates an election.
 			if rf.nodeState == follower {
-				DPrintf("[kickoff@raft.go][%d]current state is follower ,so becames a candidate and initiates an election ", rf.me)
+				DPrintf("[kickoff@raft.go][%d]current state is follower ,so becames a candidate and call initiates an election ", rf.me)
 				rf.InitialElection()
 				//electionticker.Stop()
-				//electionticker:= time.NewTicker(rf.electionTimer)
+				//electionticker:= time.NewTicker(rf.electionTimeout)
 				//defer electionticker.Stop()
 			} else {
 				DPrintf("[kickoff@raft.go][%d]current node state is [%s], do noting", rf.me, rf.GetNodeState())
@@ -538,7 +589,7 @@ func (rf *Raft) kickoff() {
 			DPrintf("[kickoff@raft.go][%d]Electionticker Ticker timeout", rf.me)
 			rf.SendReqVote2All()
 			DPrintf("[kickoff@raft.go][%d]kickoff Exit", rf.me)
-			return
+			//return
 		}
 	}
 	DPrintf("[kickoff@raft.go][%d]kickoff Exit", rf.me)
@@ -569,8 +620,10 @@ func (rf *Raft) InitialElection() {
 	//Vote for self
 	rf.votedFor = rf.me
 	//Reset election timer
-	rf.SetElectionTimer(true)
+	rf.SetElectionTimeout(true)
 	//Send RequestVote RPCs to all other servers
+
+	DPrintf("[InitialElection@raft.go][%d] Attempting an election at term [%d]  Entry", rf.me, rf.currentTerm)
 
 	DPrintf("[InitialElection@raft.go][%d] InitialElection  Exit", rf.me)
 }
@@ -583,111 +636,93 @@ func (rf *Raft) SendReqVote2All() {
 		return
 	}
 
+	var wg sync.WaitGroup
+
 	votesCount := 1
 	for i, curPeer := range rf.peers {
 		//DPrintf("[SendReqVote2All@raft.go][%d] rf.peers[%d] := [%s]",rf.me,i,curPeer.GetName())
-		if i != rf.me {
-			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), i, curPeer.GetName())
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(server int) {
+			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, curPeer.GetName())
 			args := RequestVoteArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm()}
 			reply := RequestVoteReply{}
-			DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote Entry", rf.me)
-			rf.sendRequestVote(i, &args, &reply)
+			DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote", rf.me)
+			rf.sendRequestVote(server, &args, &reply)
 			if reply.VoteGranted {
 				votesCount++
 			}
-			// Need using peer total number to count
-			majority := len(rf.peers)/2 + 1
-			DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, majority)
-			if votesCount >= majority {
-				DPrintf("[SendReqVote2All@raft.go][%d] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, votesCount)
-				rf.ChangeNodeState(leader)
-				rf.SendAppendEntries2All()
-			}
-		}
+			wg.Done()
+		}(i)
 	}
 
-	/*votesCount := 0
+	wg.Wait() //need update here
 
-			//Send RequestVote RPCs to all other servers
-			args  := RequestVoteArgs{rf.currentTerm,rf.me,rf.lastApplied,rf.GetLastLogTerm()}
-			reply := RequestVoteReply{}
+	// Need using peer total number to count
+	majority := len(rf.peers)/2 + 1
+	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, majority)
 
-	    DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote Entry",rf.me )
-			rf.sendRequestVote(0, &args, &reply )
-			if (reply.VoteGranted){
-						votesCount ++
-			}
-
-			reply2 := RequestVoteReply{}
-			rf.sendRequestVote(1, &args, &reply2 )
-			if (reply2.VoteGranted){
-						votesCount ++
-			}
-			if (votesCount >= 2){
-				DPrintf("[SendReqVote2All@raft.go][%d] ChangeNodeState to leader because total votesCount:=[%d]",rf.me,votesCount )
-				rf.ChangeNodeState(leader)
-			}
-			DPrintf("[TestInitialElection@raft.go][%d] Call sendRequestVote Exit. votesCount:=[%d]",rf.me,votesCount)
-	*/
-
-	/*func (rf *Raft) InitialElection() {
-
-			votesCount := 0
-
-			if (rf.me == 2) {
-					votesCount = 1
-					//On conversion to candidate
-					rf.ChangeNodeState(candidate)
-					//Increment CurrentTerm
-					rf.PlusCurrentTerm()
-					//Vote for self
-					rf.votedFor = rf.me
-					//Reset election timer
-					rf.SetElectionTimer(true)
-					//Send RequestVote RPCs to all other servers
-					args  := RequestVoteArgs{rf.currentTerm,rf.me,rf.lastApplied,rf.GetLastLogTerm()}
-					reply := RequestVoteReply{}
-
-	        DPrintf("[TestInitialElection@raft.go][%d] Call sendRequestVote Entry",rf.me )
-					rf.sendRequestVote(0, &args, &reply )
-					if (reply.VoteGranted){
-								votesCount ++
-					}
-
-					reply2 := RequestVoteReply{}
-					rf.sendRequestVote(1, &args, &reply2 )
-					if (reply2.VoteGranted){
-								votesCount ++
-					}
-					// Need using peer total number to count
-					if (votesCount >= 2){
-						DPrintf("[TestInitialElection@raft.go][%d] ChangeNodeState to leader because total votesCount:=[%d]",rf.me,votesCount )
-						rf.ChangeNodeState(leader)
-					}
-					DPrintf("[TestInitialElection@raft.go][%d] Call sendRequestVote Exit. votesCount:=[%d]",rf.me,votesCount)
-			} else {
-				  DPrintf("[TestInitialElection@raft.go][%d] Call Nothing" ,rf.me)
-			}
-	}*/
-
+	if votesCount >= majority {
+		rf.ChangeNodeState(leader)
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(),votesCount)
+		rf.SendAppendEntries2All()
+	} else {
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] Cannot change to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(),votesCount)
+	}
 }
 
 //Send AppendEntries RPCs to all other servers
+//Once a candidate wins an election, it becomes leader. It then sends heartbeat messages to all of the other servers to establish its authority and prevent new elections.
 func (rf *Raft) SendAppendEntries2All() {
-	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendReqVote2All Entry  ", rf.me, rf.GetNodeState())
-	/*if rf.nodeState != candidate {
-		DPrintf("[SendReqVote2All@raft.go][%d][%s] SendReqVote2All Exit,because rf.nodeState != candidate  ", rf.me, rf.GetNodeState())
+	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Entry  ", rf.me, rf.GetNodeState())
+	if rf.nodeState != leader {
+		DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Exit,because rf.nodeState != leader  ", rf.me, rf.GetNodeState())
 		return
-	}*/
+	}
 
 	for i, curPeer := range rf.peers {
 		//DPrintf("[SendReqVote2All@raft.go][%d] rf.peers[%d] := [%s]",rf.me,i,curPeer.GetName())
-		if i != rf.me {
-			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), i, curPeer.GetName())
+		if i == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			DPrintf("[SendAppendEntries2All@raft.go][%d][%s] send AppendEntries for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, curPeer.GetName())
 			args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm(), rf.commitIndex}
 			reply := AppendEntriesReply{}
-			DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote Entry", rf.me)
-			rf.sendAppendEntries(i, &args, &reply)
-		}
+			//DPrintf("[SendAppendEntries2All@raft.go][%d] Call AppendEntries Entry", rf.me)
+			rf.sendAppendEntries(server, &args, &reply)
+		}(i)
 	}
+	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Exit  ", rf.me, rf.GetNodeState())
 }
+
+/*                    Rules for Servers
+
+All Servers:
+• If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3)
+• If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+
+Followers (§5.2):
+• Respond to RPCs from candidates and leaders
+• If election timeout elapses without receiving AppendEntries RPC from current leader or granting vote to candidate: convert to candidate
+
+Candidates (§5.2):
+• On conversion to candidate, start election:
+• Increment currentTerm
+• Vote for self
+• Reset election timer
+• Send RequestVote RPCs to all other servers
+• If votes received from majority of servers: become leader
+• If AppendEntries RPC received from new leader: convert to follower
+• If election timeout elapses: start new election
+
+Leaders:
+• Upon election: send initial empty AppendEntries RPCs (heartbeat) to each server; repeat during idle periods to prevent election timeouts (§5.2)
+• If command received from client: append entry to local log, respond after entry applied to state machine (§5.3)
+• If last log index ≥ nextIndex for a follower: send AppendEntries RPC with log entries starting at nextIndex
+• If successful: update nextIndex and matchIndex for follower (§5.3)
+• If AppendEntries fails because of log inconsistency:decrement nextIndex and retry (§5.3)
+• If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).*/
