@@ -551,7 +551,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) kickoff() {
 	DPrintf("[kickoff@raft.go][%d]kickoff Entry", rf.me)
 
-	hearBeatTicker := time.NewTicker(100 * time.Millisecond)
+	//The tester requires that the leader send heartbeat RPCs no more than ten times per second.
+	hearBeatTicker := time.NewTicker(200 * time.Millisecond)
 	defer hearBeatTicker.Stop()
 
 	//const RaftElectionTimeout = 1000 * time.Millisecond
@@ -628,7 +629,7 @@ func (rf *Raft) InitialElection() {
 	DPrintf("[InitialElection@raft.go][%d] InitialElection  Exit", rf.me)
 }
 
-//Send RequestVote RPCs to all other servers
+//Send RequestVote RPCs to all other servers ,using NewCond
 func (rf *Raft) SendReqVote2All() {
 	DPrintf("[SendReqVote2All@raft.go][%d][%s] SendReqVote2All Entry  ", rf.me, rf.GetNodeState())
 	if rf.nodeState != candidate {
@@ -636,40 +637,55 @@ func (rf *Raft) SendReqVote2All() {
 		return
 	}
 
-	var wg sync.WaitGroup
-
+	var mu sync.Mutex
+	//Use this condition variable for kinkd of coordinating
+	//when a certain condition some property on that shared data
+	//when that becomes true
+	cond := sync.NewCond(&mu)
+	//Some share data
 	votesCount := 1
+	finishedLoop := 1
+
 	for i, curPeer := range rf.peers {
 		//DPrintf("[SendReqVote2All@raft.go][%d] rf.peers[%d] := [%s]",rf.me,i,curPeer.GetName())
 		if i == rf.me {
 			continue
 		}
-		wg.Add(1)
 		go func(server int) {
 			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, curPeer.GetName())
 			args := RequestVoteArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm()}
 			reply := RequestVoteReply{}
 			DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote", rf.me)
 			rf.sendRequestVote(server, &args, &reply)
+
+			mu.Lock()
+			defer mu.Unlock()
+
 			if reply.VoteGranted {
 				votesCount++
 			}
-			wg.Done()
+			finishedLoop++
+			cond.Broadcast()
 		}(i)
 	}
-
-	wg.Wait() //need update here
-
 	// Need using peer total number to count
 	majority := len(rf.peers)/2 + 1
 	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, majority)
 
+	mu.Lock()
+	for votesCount < majority && finishedLoop != majority+1 {
+		DPrintf("[SendReqVote2All@raft.go][%d] cond.Wait()  votesCount=[%d] finishedLoop=[%d]", rf.me, votesCount, finishedLoop)
+		cond.Wait()
+	}
+
 	if votesCount >= majority {
+		mu.Unlock()
 		rf.ChangeNodeState(leader)
-		DPrintf("[SendReqVote2All@raft.go][%d][%s] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(),votesCount)
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
 		rf.SendAppendEntries2All()
 	} else {
-		DPrintf("[SendReqVote2All@raft.go][%d][%s] Cannot change to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(),votesCount)
+		mu.Unlock()
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] Cannot change to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
 	}
 }
 
@@ -726,3 +742,48 @@ Leaders:
 • If successful: update nextIndex and matchIndex for follower (§5.3)
 • If AppendEntries fails because of log inconsistency:decrement nextIndex and retry (§5.3)
 • If there exists an N such that N > commitIndex, a majority of matchIndex[i] ≥ N, and log[N].term == currentTerm: set commitIndex = N (§5.3, §5.4).*/
+
+//Send RequestVote RPCs to all other servers ,using WaitGroup
+func (rf *Raft) SendReqVote2AllVerWaitGroup() {
+	DPrintf("[SendReqVote2All@raft.go][%d][%s] SendReqVote2All Entry  ", rf.me, rf.GetNodeState())
+	if rf.nodeState != candidate {
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] SendReqVote2All Exit,because rf.nodeState != candidate  ", rf.me, rf.GetNodeState())
+		return
+	}
+
+	var wg sync.WaitGroup
+
+	votesCount := 1
+	for i, curPeer := range rf.peers {
+		//DPrintf("[SendReqVote2All@raft.go][%d] rf.peers[%d] := [%s]",rf.me,i,curPeer.GetName())
+		if i == rf.me {
+			continue
+		}
+		wg.Add(1)
+		go func(server int) {
+			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, curPeer.GetName())
+			args := RequestVoteArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm()}
+			reply := RequestVoteReply{}
+			DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote", rf.me)
+			rf.sendRequestVote(server, &args, &reply)
+			if reply.VoteGranted {
+				votesCount++
+			}
+			wg.Done()
+		}(i)
+	}
+
+	wg.Wait() //need update here
+
+	// Need using peer total number to count
+	majority := len(rf.peers)/2 + 1
+	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, majority)
+
+	if votesCount >= majority {
+		rf.ChangeNodeState(leader)
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
+		rf.SendAppendEntries2All()
+	} else {
+		DPrintf("[SendReqVote2All@raft.go][%d][%s] Cannot change to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
+	}
+}
