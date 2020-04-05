@@ -1,8 +1,7 @@
+// Version: 0.2
+// Date:2020/4/4
+// Memo: Main loop change ,refer to etct's raft code
 package raft
-
-// Version: 0.1
-// Date:2020/4/2
-// Memo:
 
 //
 // this is an outline of the API that raft must expose to
@@ -48,7 +47,19 @@ type ApplyMsg struct {
 }
 
 //
+//Server states. Followers only respond to requests from other servers.
+//If a follower receives no communication, it becomes a candidate and initiates an election.
+//A candidate that receives votes from a majority of the full cluster becomes the new leader.
+//Leaders typically operate until they fail.
 //
+// TODO(hyx): need complete the following statues change logical
+//
+// SC0 start up  -> follower  //Start of day                               --done
+// SC1 follower  -> candidate //times out ,starts election                 --done
+// SC2 candidate -> leader    //receives votes from majority of Servers    --done
+// SC3 candidate -> candidate //times out, new elections                   --TODO(hyx)
+// SC4 candidate -> follower  //discovers current leader or new term1      --TODO(hyx)
+// SC5 leader    -> follower  //discovers server with higher term          --TODO(hyx)
 //
 type RaftNodeState int
 
@@ -57,6 +68,16 @@ const (
 	candidate
 	leader
 )
+
+var rnsmap = [...]string{
+	"Follower",
+	"Candidate",
+	"Leader",
+}
+
+func (rns RaftNodeState) String() string {
+	return rnsmap[rns]
+}
 
 //
 // A Go object implementing a single Raft peer.
@@ -73,7 +94,8 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	//============================State==========================================
-	//Persistent state on all server：(Updated on stable storage before responding to RPCs)
+	//Persistent state on all server：
+	//(Updated on stable storage before responding to RPCs)
 	currentTerm int                   //latest term server has seen.(initialized to 0 on first boot,increases monotonically)
 	votedFor    int                   //CandidateId that reveived vore in current term (or null if none)
 	logs        []map[int]interface{} //log entries;each entry contains command for state machine and term when entry was received by leader
@@ -102,8 +124,31 @@ type Raft struct {
 
 	//temp values
 	reStartHeartBeat bool
+
+	leaderId int //the leader id
+	tick     func()
 	//Debug setting valuse
 	enableDump bool
+}
+
+func (rf *Raft) StartOfDay() {
+	DPrintf("[StartOfDay@raft.go][%d] StartOfDay Start", rf.me)
+
+	rf.currentTerm = 0 //initialized to 0 on first boot,increases monotonically
+	rf.votedFor = -1
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.leaderId = -1
+
+	//My initialization code
+	rf.ChangeNodeState(follower)
+	rf.reStartHeartBeat = false
+
+	//debuging initialize values
+	//rf.enableDump = false
+	rf.enableDump = true
+
+	DPrintf("[StartOfDay@raft.go][%d] StartOfDay Exit", rf.me)
 }
 
 func (rf *Raft) PlusCurrentTerm() {
@@ -116,30 +161,49 @@ func (rf *Raft) IsLeader() bool {
 }
 
 func (rf *Raft) ChangeNodeState(currStatus RaftNodeState) {
-	rf.nodeState = currStatus
+	// SC0 start up  -> follower  //Start of day                               --done
+	// SC1 follower  -> candidate //times out ,starts election                 --done
+	// SC2 candidate -> leader    //receives votes from majority of Servers    --done
+	// SC3 candidate -> candidate //times out, new elections                   --TODO(hyx)
+	// SC4 candidate -> follower  //discovers current leader or new term1      --TODO(hyx) half
+	// SC5 leader    -> follower  //discovers server with higher term          --TODO(hyx)
 	switch rf.nodeState {
 	case follower:
-		DPrintf("[ChangeNodeState@raft.go][%d] rf.nodeState:= follower", rf.me)
+		switch currStatus {
+		case candidate:
+			DPrintf("[ChangeNodeState@raft.go][%d]SC1 ChangeNodeState from follower to candidate ,times out starts election", rf.me)
+		case follower:
+			DPrintf("[ChangeNodeState@raft.go][%d]SC0 ChangeNodeState from init to follower ,start of day", rf.me)
+		default:
+			DPrintf("[ChangeNodeState@raft.go][%d]XXX ChangeNodeState from follower to %v", rf.me, currStatus)
+		}
+		rf.nodeState = currStatus
 	case candidate:
-		DPrintf("[ChangeNodeState@raft.go][%d] rf.nodeState:= candidate", rf.me)
+		switch currStatus {
+		case leader:
+			DPrintf("[ChangeNodeState@raft.go][%d]SC2 ChangeNodeState from candidate to leader,receives votes from majority of Servers", rf.me)
+		case candidate:
+			DPrintf("[ChangeNodeState@raft.go][%d]SC3 ChangeNodeState from candidate to candidate ,times out starts election", rf.me)
+		case follower:
+			DPrintf("[ChangeNodeState@raft.go][%d]SC4 ChangeNodeState from candidate to follower ,discovers current leader or new term1 ", rf.me)
+		default:
+			DPrintf("[ChangeNodeState@raft.go][%d]XXX ChangeNodeState from candidate to %v", rf.me, currStatus)
+		}
+		rf.nodeState = currStatus
 	case leader:
-		DPrintf("[ChangeNodeState@raft.go][%d] rf.nodeState:= leader", rf.me)
+		if currStatus == follower {
+			DPrintf("[ChangeNodeState@raft.go][%d]SC5 ChangeNodeState From leader to follow ,discovers server with higher term   ", rf.me)
+		} else {
+			DPrintf("[ChangeNodeState@raft.go][%d]XXX ChangeNodeState from leader to %v", rf.me, currStatus)
+		}
+		rf.nodeState = currStatus
 	default:
 		DPrintf("[ChangeNodeState@raft.go][%d] rf.nodeState:= N/A", rf.me)
 	}
 }
 
 func (rf *Raft) GetNodeState() string {
-	switch rf.nodeState {
-	case follower:
-		return "follower"
-	case candidate:
-		return "candidate"
-	case leader:
-		return "leader"
-	default:
-		return "N/A"
-	}
+	return rnsmap[rf.nodeState]
 }
 
 func (rf *Raft) SetElectionTimeout(enableTimer bool) {
@@ -166,6 +230,10 @@ func (rf *Raft) SetHeartBeatTimeout(enableTimer bool) {
 	}
 }
 
+func (rf *Raft) HasLeader() bool { return rf.leaderId != -1 }
+
+func (rf *Raft) SetLeader(leaderID int) { rf.leaderId = leaderID }
+
 func (rf *Raft) DumpRaft() {
 	if !rf.enableDump {
 		return
@@ -175,6 +243,7 @@ func (rf *Raft) DumpRaft() {
 	DPrintf("[DumpRaft@raft.go] rf.dead := [%d]", rf.dead)
 	DPrintf("[DumpRaft@raft.go] rf.currentTerm := [%d]", rf.currentTerm)
 	DPrintf("[DumpRaft@raft.go] rf.votedFor := [%d]", rf.votedFor)
+	DPrintf("[DumpRaft@raft.go] rf.leaderId := [%d]", rf.leaderId)
 	DPrintf("[DumpRaft@raft.go] rf.commitIndex := [%d]", rf.commitIndex)
 	DPrintf("[DumpRaft@raft.go] rf.lastApplied := [%d]", rf.lastApplied)
 	DPrintf("[DumpRaft@raft.go] rf.electionTimeout := [%v]", rf.electionTimeout)
@@ -209,21 +278,17 @@ func (rf *Raft) DumpRaft() {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
+	DPrintf("[GetState@raft.go][%d] GetState() Entry", rf.me)
 	var term int
 	var isleader bool
+
 	// Your code here (2A).
-
-	/*if (rf.me == 0) {
-		rf.ChangeNodeState(leader)
-	}*/
-
 	term = rf.currentTerm
 	isleader = rf.IsLeader()
 
 	//dump output values
 	rf.DumpRaft()
-	DPrintf("[GetState@raft.go][%d] GetState() Exit return term:=[%d] isLeader:=[%t] ", rf.me, term, isleader)
+	DPrintf("[GetState@raft.go][%d] GetState() Exit, return term:=[%d] isLeader:=[%t] ", rf.me, term, isleader)
 	return term, isleader
 }
 
@@ -434,6 +499,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Your code here (2A, 2B).
 	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntries() Entry", rf.me, rf.GetNodeState())
 	//set return value
+
+	rf.SetLeader(args.LeaderId)
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
@@ -472,8 +539,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 	DPrintf("[Start@raft.go] Start() Entry")
+	index = rf.commitIndex
 	term = rf.currentTerm
-
+	isLeader = rf.IsLeader()
 	DPrintf("[Start@raft.go] Start() Exit. index:=[%d] term:=[%d] isLeader:=[%t]", index, term, isLeader)
 	return index, term, isLeader
 }
@@ -490,7 +558,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 //
 func (rf *Raft) Kill() {
+	DPrintf("[Kill@raft.go][%d]Kill Entry", rf.me)
 	atomic.StoreInt32(&rf.dead, 1)
+	DPrintf("[Kill@raft.go][%d]Kill Exit", rf.me)
 	// Your code here, if desired.
 }
 
@@ -519,22 +589,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	DPrintf("[Make@raft.go][%d] initialized", rf.me)
-	rf.currentTerm = 1
-	rf.votedFor = -1
-	rf.commitIndex = 0
-	rf.lastApplied = 0
+	DPrintf("[Make@raft.go][%d] StartOfDay initialized", rf.me)
+	rf.StartOfDay()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-	//My initialization code
-	rf.nodeState = follower
-	rf.reStartHeartBeat = false
-
-	//debuging initialize values
-	//rf.enableDump = false
-	rf.enableDump = true
 
 	//Modify Make() to create a background goroutine that will kick off leader election periodically by
 	//sending out RequestVote RPCs when it hasn't heard from another peer for a while.
@@ -543,11 +602,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	var command interface{}
 	rf.Start(command)
 
-	go rf.kickoff()
+	//Refre the etcd example code ,the newRaftNode() initiates a raftnode instance
+	//The raftnode has a member named node (node.go),and the node had raft instance
+	newRaftNode(rf)
+
+	//kickoff is simple implementation for testing case
+	//go rf.kickoff()
 
 	return rf
 }
 
+//
+// The kickoff is simple implementation, only tesing case TestInitialElection2A be passed
+// TODO(hyx): Using mit suggestion to complete all testing cases in the future.
+//
 func (rf *Raft) kickoff() {
 	DPrintf("[kickoff@raft.go][%d]kickoff Entry", rf.me)
 
@@ -562,6 +630,7 @@ func (rf *Raft) kickoff() {
 	defer electionticker.Stop()
 
 	for {
+
 		select {
 		case <-hearBeatTicker.C:
 			DPrintf("[kickoff@raft.go][%d]HearBeatTicker timeout", rf.me)
@@ -589,9 +658,18 @@ func (rf *Raft) kickoff() {
 			//rf.TestInitialElection()
 			DPrintf("[kickoff@raft.go][%d]Electionticker Ticker timeout", rf.me)
 			rf.SendReqVote2All()
-			DPrintf("[kickoff@raft.go][%d]kickoff Exit", rf.me)
+			//DPrintf("[kickoff@raft.go][%d]kickoff Exit", rf.me)
 			//return
 		}
+
+		if rf.killed() {
+			DPrintf("[kickoff@raft.go][%d]kickoff Exit ,becase be killed", rf.me)
+			break
+		} else {
+			DPrintf("[kickoff@raft.go][%d]kickoff killed is false", rf.me)
+		}
+		time.Sleep(5 * time.Millisecond)
+
 	}
 	DPrintf("[kickoff@raft.go][%d]kickoff Exit", rf.me)
 }

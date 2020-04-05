@@ -142,14 +142,14 @@ func (cfg *config) start1(i int) {
 	cfg.endnames[i] = make([]string, cfg.n)
 	for j := 0; j < cfg.n; j++ {
 		cfg.endnames[i][j] = randstring(20)
-		DPrintf("[start1@confg.go] cfg.endnames[%d][%d]:=[%s]", i,j,cfg.endnames[i][j])
+		DPrintf("[start1@confg.go] cfg.endnames[%d][%d]:=[%s]", i, j, cfg.endnames[i][j])
 	}
 
 	// a fresh set of ClientEnds.
 	ends := make([]*labrpc.ClientEnd, cfg.n)
 	for j := 0; j < cfg.n; j++ {
 		ends[j] = cfg.net.MakeEnd(cfg.endnames[i][j])
-		DPrintf("[start1@confg.go] cfg.net.Connect cfg.endnames[%d][%d]:=[%s]", i,j,cfg.endnames[i][j])
+		DPrintf("[start1@confg.go] cfg.net.Connect cfg.endnames[%d][%d]:=[%s]", i, j, cfg.endnames[i][j])
 		cfg.net.Connect(cfg.endnames[i][j], j)
 	}
 
@@ -225,13 +225,17 @@ func (cfg *config) checkTimeout() {
 }
 
 func (cfg *config) cleanup() {
+	//println("[kickoff@raft.go] call cleanup ")
 	for i := 0; i < len(cfg.rafts); i++ {
 		if cfg.rafts[i] != nil {
+			//println("[kickoff@raft.go] call kill ")
 			cfg.rafts[i].Kill()
 		}
 	}
 	cfg.net.Cleanup()
 	cfg.checkTimeout()
+	//Waiting for raft exit
+	time.Sleep(100 * time.Millisecond)
 }
 
 // attach server i to the net.
@@ -507,6 +511,6 @@ func (cfg *config) end() {
 		cfg.mu.Unlock()
 
 		fmt.Printf("  ... Passed --")
-		fmt.Printf("  %4.1f  %d %4d %7d %4d\n", t, npeers, nrpc, nbytes, ncmds)
+		fmt.Printf(" real time:=[%4.1f]  number of Raft peers:=[%d]  number of RPC sends:=[%4d] \n  ... Passed -- number of bytes:=[%7d]  number of Raft agreements reported:=[%4d]\n", t, npeers, nrpc, nbytes, ncmds)
 	}
 }
