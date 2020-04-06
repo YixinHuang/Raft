@@ -56,14 +56,14 @@ func newNode(rn *Raft) Node {
 // Tick increments the internal logical clock for this Node. Election timeouts
 // and heartbeat timeouts are in units of ticks.
 func (n *Node) Tick() {
-	DPrintf("[Tick@node.go] Tick Entry")
+	//DPrintf("[Tick@node.go] Tick Entry")
 	select {
 	case n.tickc <- struct{}{}:
 	case <-n.done:
 	default:
 		//	n.rn.raft.logger.Warningf("%x (leader %v) A tick missed to fire. Node blocks too long!", n.rn.raft.id, n.rn.raft.id == n.rn.raft.lead)
 	}
-	DPrintf("[Tick@node.go] Tick Exit")
+	//DPrintf("[Tick@node.go] Tick Exit")
 }
 
 func (n *Node) Run() {
@@ -75,8 +75,7 @@ func (n *Node) Run() {
 		select {
 		case <-n.tickc:
 			n.rn.tick()
-			DPrintf("[Run@node.go][%d] ticker", n.rn.me)
-
+			//DPrintf("[Run@node.go][%d] ticker", n.rn.me)
 		}
 		if n.rn.killed() {
 			DPrintf("[Run@node.go][%d] Node Run exit ,because be killed", n.rn.me)
@@ -84,7 +83,7 @@ func (n *Node) Run() {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-
+	DPrintf("[Run@node.go][%d] Run Exit", n.rn.me)
 	/*	var propc chan msgWithResult
 		var readyc chan Ready
 		var advancec chan struct{}
@@ -187,5 +186,5 @@ func (n *Node) Run() {
 				return
 			}
 		}*/
-	DPrintf("[Run@node.go][%d] Run Exit", n.rn.me)
+
 }

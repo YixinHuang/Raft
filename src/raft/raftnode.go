@@ -49,7 +49,7 @@ func (rn *raftNode) StartRaft(rf *Raft) {
 func (rn *raftNode) ServeChannels(rf *Raft) {
 	DPrintf("[ServeChannels@raftnode.go][%d] ServeChannels Entry", rn.id)
 
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 
 	// event loop on raft state machine updates
@@ -57,7 +57,7 @@ func (rn *raftNode) ServeChannels(rf *Raft) {
 		select {
 		case <-ticker.C:
 			rn.node.Tick()
-			DPrintf("[ServeChannels@raftnode.go][%d] ticker", rf.me)
+			//DPrintf("[ServeChannels@raftnode.go][%d] ticker", rf.me)
 			/*case <-rc.stopc:
 			rc.stop()
 			return*/

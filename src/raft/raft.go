@@ -3,6 +3,8 @@
 // Memo: Main loop change ,refer to etct's raft code
 package raft
 
+// Package raft ...
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -20,14 +22,19 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "sync/atomic"
-import "../labrpc"
-import "time"
-import "math/rand"
+import (
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"../labrpc"
+)
 
 // import "bytes"
 // import "../labgob"
+
+const None int = -1
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -79,6 +86,8 @@ func (rns RaftNodeState) String() string {
 	return rnsmap[rns]
 }
 
+type stepFunc func(r *Raft, m Message) error
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -93,7 +102,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	//============================State==========================================
+	//=========================State From Paper===================================
 	//Persistent state on all server：
 	//(Updated on stable storage before responding to RPCs)
 	currentTerm int                   //latest term server has seen.(initialized to 0 on first boot,increases monotonically)
@@ -111,7 +120,6 @@ type Raft struct {
 	nextIndex  []int //for each server, index of the next log entry to send to that server(initialized to leader last log index +1)
 	matchIndex []int //for each server,index of highest entry known to be replicated on server(initialized to 0,increases monotonically)
 	//===========================================================================
-
 	//internal value declare here
 	nodeState RaftNodeState
 
@@ -119,14 +127,19 @@ type Raft struct {
 	//so the broadcast time may range from 0.5ms to 20ms, depending on storage technology.
 	//As a result, the election timeout is likely to be somewhere between 10ms and 500ms.
 	//broadcastTime ≪ electionTimeout ≪ MTBF
-	electionTimeout  time.Duration
-	heartbeatTimeout time.Duration
+	heartbeatTimeout int
+	electionTimeout  int
 
-	//temp values
+	//Copy from ETCD
+	lead    int //the leader id
+	tick    func()
+	step    stepFunc
+	votes   map[int]bool
+	elapsed int // number of ticks since the last msg
+	rand    *rand.Rand
+
+	//temp values fro kickoff
 	reStartHeartBeat bool
-
-	leaderId int //the leader id
-	tick     func()
 	//Debug setting valuse
 	enableDump bool
 }
@@ -134,21 +147,20 @@ type Raft struct {
 func (rf *Raft) StartOfDay() {
 	DPrintf("[StartOfDay@raft.go][%d] StartOfDay Start", rf.me)
 
-	rf.currentTerm = 0 //initialized to 0 on first boot,increases monotonically
-	rf.votedFor = -1
+	rf.reset(0) //initialized to 0 on first boot,increases monotonically
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.leaderId = -1
 
 	//My initialization code
 	rf.ChangeNodeState(follower)
-	rf.reStartHeartBeat = false
-
-	//debuging initialize values
-	//rf.enableDump = false
-	rf.enableDump = true
+	rf.rand = rand.New(rand.NewSource(time.Now().Unix() + int64(rf.me)))
 
 	DPrintf("[StartOfDay@raft.go][%d] StartOfDay Exit", rf.me)
+}
+
+func (rf *Raft) SetCurrentTerm(term int) {
+	rf.currentTerm = term
+	DPrintf("[SetCurrentTerm@raft.go][%d] rf.currentTerm:=[%d]", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) PlusCurrentTerm() {
@@ -156,9 +168,7 @@ func (rf *Raft) PlusCurrentTerm() {
 	DPrintf("[PlusCurrentTerm@raft.go][%d] rf.currentTerm:=[%d]", rf.me, rf.currentTerm)
 }
 
-func (rf *Raft) IsLeader() bool {
-	return rf.nodeState == leader
-}
+func (rf *Raft) IsLeader() bool { return rf.nodeState == leader }
 
 func (rf *Raft) ChangeNodeState(currStatus RaftNodeState) {
 	// SC0 start up  -> follower  //Start of day                               --done
@@ -202,37 +212,16 @@ func (rf *Raft) ChangeNodeState(currStatus RaftNodeState) {
 	}
 }
 
-func (rf *Raft) GetNodeState() string {
-	return rnsmap[rf.nodeState]
+func (rf *Raft) GetNodeState() string { return rnsmap[rf.nodeState] }
+
+func (rf *Raft) HasLeader() bool { return rf.lead != None }
+
+func (rf *Raft) SetLeader(leaderID int) { rf.lead = leaderID }
+
+func (rf *Raft) SetElapsed(times int) {
+	rf.elapsed = times
+	DPrintf("[SetElapsed@raft.go][%d] set rf.elapsed := [%d]", rf.me, rf.elapsed)
 }
-
-func (rf *Raft) SetElectionTimeout(enableTimer bool) {
-	if enableTimer {
-		rand.Seed(time.Now().Unix() + int64(rf.me))
-		rf.electionTimeout = time.Duration(1000-rand.Intn(300)) * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
-		DPrintf("[SetElectionTimeout@raft.go][%d] Enable rf.ectionTimeout:= [%v]", rf.me, rf.electionTimeout)
-	} else {
-		rf.electionTimeout = -1
-		DPrintf("[SetElectionTimeout@raft.go][%d] Disable electionTimeout", rf.me)
-	}
-
-}
-
-func (rf *Raft) SetHeartBeatTimeout(enableTimer bool) {
-	if enableTimer {
-		rand.Seed(time.Now().Unix() + int64(rf.me))
-		//rf.heartbeatTimeout = time.Duration(1000-rand.Intn(300)) * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
-		rf.heartbeatTimeout = 100 * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
-		DPrintf("[SetHeartBeatTimeout@raft.go][%d] Enable rf.ectionTimeout:= [%v]", rf.me, rf.electionTimeout)
-	} else {
-		rf.heartbeatTimeout = -1
-		DPrintf("[SetHeartBeatTimeout@raft.go][%d] Disable electionTimeout", rf.me)
-	}
-}
-
-func (rf *Raft) HasLeader() bool { return rf.leaderId != -1 }
-
-func (rf *Raft) SetLeader(leaderID int) { rf.leaderId = leaderID }
 
 func (rf *Raft) DumpRaft() {
 	if !rf.enableDump {
@@ -243,11 +232,12 @@ func (rf *Raft) DumpRaft() {
 	DPrintf("[DumpRaft@raft.go] rf.dead := [%d]", rf.dead)
 	DPrintf("[DumpRaft@raft.go] rf.currentTerm := [%d]", rf.currentTerm)
 	DPrintf("[DumpRaft@raft.go] rf.votedFor := [%d]", rf.votedFor)
-	DPrintf("[DumpRaft@raft.go] rf.leaderId := [%d]", rf.leaderId)
+	DPrintf("[DumpRaft@raft.go] rf.lead := [%d]", rf.lead)
 	DPrintf("[DumpRaft@raft.go] rf.commitIndex := [%d]", rf.commitIndex)
 	DPrintf("[DumpRaft@raft.go] rf.lastApplied := [%d]", rf.lastApplied)
-	DPrintf("[DumpRaft@raft.go] rf.electionTimeout := [%v]", rf.electionTimeout)
-	DPrintf("[DumpRaft@raft.go] rf.heartbeatTimeout := [%v]", rf.heartbeatTimeout)
+	DPrintf("[DumpRaft@raft.go] rf.elapsed := [%d]", rf.elapsed)
+	DPrintf("[DumpRaft@raft.go] rf.electionTimeout := [%d]", rf.electionTimeout)
+	DPrintf("[DumpRaft@raft.go] rf.heartbeatTimeout := [%d]", rf.heartbeatTimeout)
 	DPrintf("[DumpRaft@raft.go] rf.reStartHeartBeat := [%t]", rf.reStartHeartBeat)
 
 	for i, curPeer := range rf.peers {
@@ -272,7 +262,46 @@ func (rf *Raft) DumpRaft() {
 	for i, mchInd := range rf.matchIndex {
 		DPrintf("[DumpRaft@raft.go] rf.matchIndex[%d] := [%d]", i, mchInd)
 	}
+
+	for i, voterlt := range rf.votes {
+		DPrintf("[DumpRaft@raft.go] rf.votes[%d] := [%t]", i, voterlt)
+	}
+
 	DPrintf("[DumpRaft@raft.go] ---------------------------------------------------------------------------------")
+}
+
+//-------------copy from etcd-------------------------------
+
+func (r *Raft) reset(term int) {
+	if r.currentTerm != term {
+		r.SetCurrentTerm(term)
+		r.votedFor = None
+	}
+	r.SetLeader(None)
+	r.SetElapsed(0)
+	r.votes = make(map[int]bool)
+	r.reStartHeartBeat = false
+
+	//debuging initialize values
+	//rf.enableDump = false
+	r.enableDump = true
+}
+
+// isElectionTimeout returns true if r.elapsed is greater than the
+// randomized election timeout in (electiontimeout, 2 * electiontimeout - 1).
+// Otherwise, it returns false.
+func (rf *Raft) isElectionTimeout() bool {
+	d := rf.elapsed - rf.electionTimeout
+	if d < 0 {
+		return false
+	}
+	dif := rf.rand.Int() % rf.electionTimeout
+	if d > dif {
+		DPrintf("[isElectionTimeout@raft.go][%d] return ture , because d[%d] > deff[%d], r.elapsed=[%d]", rf.me, d, dif, rf.elapsed)
+		return true
+	} else {
+		return false
+	}
 }
 
 // return currentTerm and whether this server
@@ -373,9 +402,11 @@ func (reply *RequestVoteReply) DumpRequestVoteReply() {
 //-----------------------------------------------------------------------------
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	DPrintf("[RequestVoteHandler@raft.go][%d][%s] RequestVote() Entry", rf.me, rf.GetNodeState())
-	var vote bool
-	vote = true
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	DPrintf("[RequestVoteHandler@raft.go][%d][%s] RequestVoteHandler() Entry,args.Term =[%d] args.CandidateId =[%d]", rf.me, rf.GetNodeState(), args.Term, args.CandidateId)
+	vote := true
 
 	//Reply false if term < currentTerm (§5.1)
 	if args.Term < rf.currentTerm {
@@ -384,32 +415,39 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	//If votedFor is null or candidateId, and candidate’s log is at least as up-to-date as receiver’s log, grant vote (§5.2, §5.4)
-	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+	if rf.votedFor == None || rf.votedFor == args.CandidateId {
 		if args.LastLogIndex < rf.lastApplied {
 			DPrintf("[RequestVoteHandler@raft.go][%d] Reject Vote because request LastLogIndex:[%d] < lastApplied:[%d]", rf.me, args.LastLogIndex, rf.lastApplied)
 			vote = false
 		}
 	}
 
+	// only vote once in one term
+	if args.Term == rf.currentTerm && rf.votedFor != None {
+		DPrintf("[RequestVoteHandler@raft.go][%d] Reject Vote because only vote once in one term args.Term:[%d] = rf.currentTerm:[%d],rf.votedFor=[%d]", rf.me, args.Term, rf.currentTerm, rf.votedFor)
+		vote = false
+	}
+
 	//Update current raft node value ,because note vote new leader
 	if vote {
-		DPrintf("[RequestVoteHandler@raft.go][%d] Update raft node value (From voteFor[%d] to args.CandidateId[%d]) using RequestVote parameter ", rf.me, rf.votedFor, args.CandidateId)
+		DPrintf("[RequestVoteHandler@raft.go][%d] Update raft node value voteFor(From [%d] to [%d]) using RequestVote parameter ", rf.me, rf.votedFor, args.CandidateId)
 		rf.votedFor = args.CandidateId
 		if rf.currentTerm != args.Term {
-			DPrintf("[RequestVoteHandler@raft.go][%d] Update raft node value (From currentTerm[%d] to args.Term[%d] ) using RequestVote parameter ", rf.me, rf.currentTerm, args.Term)
-			rf.currentTerm = args.Term
+			DPrintf("[RequestVoteHandler@raft.go][%d] Update raft node value currentTerm(From [%d] to [%d] ) using RequestVote parameter ", rf.me, rf.currentTerm, args.Term)
+			rf.SetCurrentTerm(args.Term)
 		}
 		//change node states
 		rf.ChangeNodeState(follower)
 
 		//rf.reStartHeartBeat = false
 		rf.reStartHeartBeat = true
+		rf.SetElapsed(0)
 	}
 
 	//set return value
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = vote
-	DPrintf("[RequestVoteHandler@raft.go][%d] RequestVote() Exit", rf.me)
+	DPrintf("[RequestVoteHandler@raft.go][%d][%s] RequestVoteHandler() Exit, rf.votedFor  =[%d],reply.Term =[%d] reply.VoteGranted =[%t]", rf.me, rf.GetNodeState(), rf.votedFor, reply.Term, reply.VoteGranted)
 }
 
 //
@@ -497,16 +535,24 @@ func (reply *AppendEntriesReply) DumpAppendEntriesReply() {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	// Your code here (2A, 2B).
-	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntries() Entry", rf.me, rf.GetNodeState())
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntriesHandler() Entry,args.Term =[%d] args.LeaderId =[%d]", rf.me, rf.GetNodeState(), args.Term, args.LeaderId)
 	//set return value
+	success := true
 
-	rf.SetLeader(args.LeaderId)
+	if args.Term < rf.currentTerm {
+		DPrintf("[AppendEntriesHandler@raft.go][%d][%s] args.Term < rf.currentTerm ", rf.me, rf.GetNodeState())
+		success = false
+	} else {
+		rf.SetLeader(args.LeaderId)
+		rf.SetElapsed(0)
+		rf.reStartHeartBeat = true
+	}
 	reply.Term = rf.currentTerm
-	reply.Success = true
+	reply.Success = success
 
-	rf.reStartHeartBeat = true
-
-	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntries() Exit", rf.me, rf.GetNodeState())
+	DPrintf("[AppendEntriesHandler@raft.go][%d][%s] AppendEntriesHandler() Exit", rf.me, rf.GetNodeState())
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -533,8 +579,8 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	index := None
+	term := None
 	isLeader := false
 
 	// Your code here (2B).
@@ -592,6 +638,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("[Make@raft.go][%d] StartOfDay initialized", rf.me)
 	rf.StartOfDay()
 
+	rf.heartbeatTimeout = 2
+	rf.electionTimeout = 30
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -624,9 +673,9 @@ func (rf *Raft) kickoff() {
 	defer hearBeatTicker.Stop()
 
 	//const RaftElectionTimeout = 1000 * time.Millisecond
-	rf.SetElectionTimeout(true)
-	DPrintf("[kickoff@raft.go][%d]Start a election timer:[%v]", rf.me, rf.electionTimeout)
-	electionticker := time.NewTicker(rf.electionTimeout)
+	eleTimeout := rf.GetRandElectionTimeout()
+	DPrintf("[kickoff@raft.go][%d]Start a election timer:[%v]", rf.me, eleTimeout)
+	electionticker := time.NewTicker(eleTimeout)
 	defer electionticker.Stop()
 
 	for {
@@ -674,6 +723,13 @@ func (rf *Raft) kickoff() {
 	DPrintf("[kickoff@raft.go][%d]kickoff Exit", rf.me)
 }
 
+func (rf *Raft) GetRandElectionTimeout() time.Duration {
+	var eleTimeout time.Duration
+	rand.Seed(time.Now().Unix() + int64(rf.me))
+	eleTimeout = time.Duration(1000-rand.Intn(300)) * time.Millisecond //config.go const RaftElectionTimeout = 1000 * time.Millisecond
+	return eleTimeout
+}
+
 func (rf *Raft) GetLastLogTerm() int {
 	DPrintf("[GetLastLogTerm@raft.go][%d] GetLastLogTerm return 0 ,need implement in future", rf.me)
 	return 0
@@ -698,8 +754,7 @@ func (rf *Raft) InitialElection() {
 	rf.PlusCurrentTerm()
 	//Vote for self
 	rf.votedFor = rf.me
-	//Reset election timer
-	rf.SetElectionTimeout(true)
+
 	//Send RequestVote RPCs to all other servers
 
 	DPrintf("[InitialElection@raft.go][%d] Attempting an election at term [%d]  Entry", rf.me, rf.currentTerm)
@@ -729,8 +784,9 @@ func (rf *Raft) SendReqVote2All() {
 		if i == rf.me {
 			continue
 		}
+		peername := curPeer.GetName()
 		go func(server int) {
-			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, curPeer.GetName())
+			DPrintf("[SendReqVote2All@raft.go][%d][%s] send RequestVote for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, peername)
 			args := RequestVoteArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm()}
 			reply := RequestVoteReply{}
 			DPrintf("[SendReqVote2All@raft.go][%d] Call sendRequestVote", rf.me)
@@ -759,8 +815,8 @@ func (rf *Raft) SendReqVote2All() {
 	if votesCount >= majority {
 		mu.Unlock()
 		rf.ChangeNodeState(leader)
-		DPrintf("[SendReqVote2All@raft.go][%d][%s] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
-		rf.SendAppendEntries2All()
+		rf.SetLeader(rf.me)
+		rf.becomeLeader()
 	} else {
 		mu.Unlock()
 		DPrintf("[SendReqVote2All@raft.go][%d][%s] Cannot change to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
@@ -770,7 +826,7 @@ func (rf *Raft) SendReqVote2All() {
 //Send AppendEntries RPCs to all other servers
 //Once a candidate wins an election, it becomes leader. It then sends heartbeat messages to all of the other servers to establish its authority and prevent new elections.
 func (rf *Raft) SendAppendEntries2All() {
-	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Entry  ", rf.me, rf.GetNodeState())
+	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Entry, rf.elapsed=[%d] ", rf.me, rf.GetNodeState(), rf.elapsed)
 	if rf.nodeState != leader {
 		DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Exit,because rf.nodeState != leader  ", rf.me, rf.GetNodeState())
 		return
@@ -781,16 +837,16 @@ func (rf *Raft) SendAppendEntries2All() {
 		if i == rf.me {
 			continue
 		}
-
+		peername := curPeer.GetName()
 		go func(server int) {
-			DPrintf("[SendAppendEntries2All@raft.go][%d][%s] send AppendEntries for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, curPeer.GetName())
+			DPrintf("[SendAppendEntries2All@raft.go][%d][%s] send AppendEntries for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, peername)
 			args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm(), rf.commitIndex}
 			reply := AppendEntriesReply{}
 			//DPrintf("[SendAppendEntries2All@raft.go][%d] Call AppendEntries Entry", rf.me)
 			rf.sendAppendEntries(server, &args, &reply)
 		}(i)
 	}
-	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Exit  ", rf.me, rf.GetNodeState())
+	DPrintf("[SendAppendEntries2All@raft.go][%d][%s] SendAppendEntries2All Exit, rf.elapsed=[%d]  ", rf.me, rf.GetNodeState(), rf.elapsed)
 }
 
 /*                    Rules for Servers
