@@ -545,6 +545,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("[AppendEntriesHandler@raft.go][%d][%s] args.Term < rf.currentTerm ", rf.me, rf.GetNodeState())
 		success = false
 	} else {
+		if rf.IsLeader() && rf.currentTerm < args.Term {
+			DPrintf("[AppendEntriesHandler@raft.go][%d][%s] Leader -> Follower ,because new Term founded ", rf.me, rf.GetNodeState())
+			rf.becomeFollower(args.Term, args.LeaderId)
+		}
 		rf.SetLeader(args.LeaderId)
 		rf.SetElapsed(0)
 		rf.reStartHeartBeat = true
