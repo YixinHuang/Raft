@@ -98,9 +98,13 @@ func TestBasicAgree2B(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2B): basic agreement")
+	//time.Sleep(1000 * time.Millisecond)
+	time.Sleep(2 * RaftElectionTimeout)
 
 	iters := 3
 	for index := 1; index < iters+1; index++ {
+		fmt.Printf("xxx@xxx.go TestBasicAgree2B Loop index:=[%d]\n", index)
+		// how many servers think a log entry is committed?
 		nd, _ := cfg.nCommitted(index)
 		if nd > 0 {
 			t.Fatalf("some have committed before Start()")

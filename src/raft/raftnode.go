@@ -12,7 +12,8 @@ type raftNode struct {
 	peers string // raft peer URLs
 	join  bool   // node is joining an existing cluster
 	// raft backing for the commit/error channel
-	node *Node
+	node  *Node
+	stopc chan struct{} // signals proposal channel closed
 }
 
 // newRaftNode initiates a raft instance and returns a committed log entry
@@ -20,30 +21,40 @@ type raftNode struct {
 // provided the proposal channel. All log entries are replayed over the
 // commit channel, followed by a nil message (to indicate the channel is
 // current), then new log entries. To shutdown, close proposeC and read errorC.
-func newRaftNode(rf *Raft) {
+func newRaftNode(rf *Raft) chan struct{} {
 	DPrintf("[newRaftNode@raftnode.go][%d] newRaftNode Entry", rf.me)
 	rn := &raftNode{
 		id:    rf.me,
 		peers: "peers",
 		join:  true,
+		stopc: make(chan struct{}),
 	}
 	rn.StartRaft(rf)
+
 	DPrintf("[newRaftNode@raftnode.go][%d] newRaftNode Exit", rf.me)
+	return rn.stopc
 }
 
-//Refre the etcd node code (node.go)
-//Firstly,the StartRaft() initiaes a node instance uisng StartNode()
+//Refer the etcd raft example (raft.go)
+//Firstly,the StartRaft() initiaes a node instance uisng StartNode()(node.go)
 //The node has a member named rf(raft.go)
 //Secondly, the StartRaft() start goroutines for main loop
 func (rn *raftNode) StartRaft(rf *Raft) {
 	DPrintf("[StartRaft@raftnode.go][%d] StartRaft Entry", rn.id)
-	rn.node = StartNode(rf)
+	rn.node = StartNode(rf) //
 
 	//curNode := StartNode(rf)
 	//curNode.rn.DumpRaft()
 	//go rc.serveRaft()
 	go rn.ServeChannels(rf)
 	DPrintf("[StartRaft@raftnode.go][%d] StartRaft Exit", rn.id)
+}
+
+// stop closes http, closes all channels, and stops raft.
+func (rn *raftNode) stop() {
+	DPrintf("[stop@raftnode.go][%d] stop Entry", rn.id)
+	rn.node.Stop()
+	DPrintf("[stop@raftnode.go][%d] stop Exit", rn.id)
 }
 
 func (rn *raftNode) ServeChannels(rf *Raft) {
@@ -58,9 +69,10 @@ func (rn *raftNode) ServeChannels(rf *Raft) {
 		case <-ticker.C:
 			rn.node.Tick()
 			//DPrintf("[ServeChannels@raftnode.go][%d] ticker", rf.me)
-			/*case <-rc.stopc:
-			rc.stop()
-			return*/
+		case <-rn.stopc:
+			DPrintf("[ServeChannels@raftnode.go][%d] rn.stopc", rn.id)
+			rn.stop()
+			break
 		}
 		if rf.killed() {
 			DPrintf("[ServeChannels@raftnode.go][%d] ServeChannels exit ,because be killed", rf.me)

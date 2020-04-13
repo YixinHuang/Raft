@@ -8,17 +8,21 @@ package raft
 // test with the original before submitting.
 //
 
-import "../labrpc"
-import "log"
-import "sync"
-import "testing"
-import "runtime"
-import "math/rand"
-import crand "crypto/rand"
-import "math/big"
-import "encoding/base64"
-import "time"
-import "fmt"
+import (
+	"log"
+	"math/rand"
+	"runtime"
+	"sync"
+	"testing"
+
+	"../labrpc"
+
+	crand "crypto/rand"
+	"encoding/base64"
+	"fmt"
+	"math/big"
+	"time"
+)
 
 func randstring(n int) string {
 	b := make([]byte, 2*n)
@@ -168,8 +172,10 @@ func (cfg *config) start1(i int) {
 	cfg.mu.Unlock()
 
 	// listen to messages from Raft indicating newly committed messages.
+
 	applyCh := make(chan ApplyMsg)
 	go func() {
+		log.Printf("xxx@xxx.go  Entry go routione")
 		for m := range applyCh {
 			err_msg := ""
 			if m.CommandValid == false {
@@ -177,14 +183,16 @@ func (cfg *config) start1(i int) {
 			} else {
 				v := m.Command
 				cfg.mu.Lock()
+				log.Printf("xxx@xxx.go  one@config.go2B m.CommandValid:=[%t] m.CommandIndex:=[%d] m.Command=[%v]", m.CommandValid, m.CommandIndex, m.Command)
 				for j := 0; j < len(cfg.logs); j++ {
 					if old, oldok := cfg.logs[j][m.CommandIndex]; oldok && old != v {
 						// some server has already committed a different value for this entry!
-						err_msg = fmt.Sprintf("commit index=%v server=%v %v != server=%v %v",
+						err_msg = fmt.Sprintf("xxx@xxx.go one@config.go2B commit index=[%v] server=[%v] [%v] != server=[%v] [%v]",
 							m.CommandIndex, i, m.Command, j, old)
 					}
 				}
 				_, prevok := cfg.logs[i][m.CommandIndex-1]
+				log.Printf("one@config.go2B  cfg.logs[%d][%d] = [%v]", i, m.CommandIndex, v)
 				cfg.logs[i][m.CommandIndex] = v
 				if m.CommandIndex > cfg.maxIndex {
 					cfg.maxIndex = m.CommandIndex
@@ -437,32 +445,46 @@ func (cfg *config) wait(index int, n int, startTerm int) interface{} {
 func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 	t0 := time.Now()
 	starts := 0
-	for time.Since(t0).Seconds() < 10 {
+	loopcnt := 0
+	for time.Since(t0).Seconds() < 20 {
 		// try all the servers, maybe one is the leader.
+		loopcnt++
+		startCnt := 0
+		log.Printf("xxx@xxx.go one@config.go2B loop count:=[%d] \n", loopcnt)
 		index := -1
 		for si := 0; si < cfg.n; si++ {
+			startCnt = si
 			starts = (starts + 1) % cfg.n
 			var rf *Raft
 			cfg.mu.Lock()
 			if cfg.connected[starts] {
 				rf = cfg.rafts[starts]
+				log.Printf("xxx@xxx.go one@config.go2B rf is connected \n")
+			} else {
+				log.Printf("xxx@xxx.go one@config.go2B rf is NOT connected \n")
 			}
 			cfg.mu.Unlock()
 			if rf != nil {
+				log.Printf("xxx@xxx.go one@config.go2B call rf.Start  Entry,cfg.n=[%d] si=[%d] starts=[%d]\n", cfg.n, si, starts)
 				index1, _, ok := rf.Start(cmd)
+				log.Printf("xxx@xxx.go one@config.go2B call rf.Start  End\n")
 				if ok {
+					log.Printf("xxx@xxx.go one@config.go2B index1=[%d] rf.me=[%d] break!!!", index1, rf.me)
 					index = index1
 					break
 				}
+			} else {
+				log.Printf("xxx@xxx.go one@config.go2B rf IS nil  End\n")
 			}
 		}
-
+		log.Printf("xxx@xxx.go one@config.go2B call nCommitted startCnt=[%d]", startCnt)
 		if index != -1 {
 			// somebody claimed to be the leader and to have
 			// submitted our command; wait a while for agreement.
 			t1 := time.Now()
 			for time.Since(t1).Seconds() < 2 {
 				nd, cmd1 := cfg.nCommitted(index)
+				log.Printf("xxx@xxx.go one@config.go2B nCommitted index=[%d] nd=[%d] expectedServers=[%d],cmd1=[%d]", index, nd, expectedServers, cmd1)
 				if nd > 0 && nd >= expectedServers {
 					// committed
 					if cmd1 == cmd {
@@ -473,13 +495,13 @@ func (cfg *config) one(cmd interface{}, expectedServers int, retry bool) int {
 				time.Sleep(20 * time.Millisecond)
 			}
 			if retry == false {
-				cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+				cfg.t.Fatalf("xxx@xxx.go one@config.go2B 1 one(%v) failed to reach agreement", cmd)
 			}
 		} else {
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
-	cfg.t.Fatalf("one(%v) failed to reach agreement", cmd)
+	cfg.t.Fatalf("xxx@xxx.go one@config.go2B 2 one(%v) failed to reach agreement", cmd)
 	return -1
 }
 

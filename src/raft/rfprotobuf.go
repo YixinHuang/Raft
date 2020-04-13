@@ -4,6 +4,11 @@
 
 package raft
 
+import (
+	"fmt"
+	"strconv"
+)
+
 //import (
 //	"errors"
 //)
@@ -60,21 +65,38 @@ func (x MessageType) String() string {
 }
 
 type Message struct {
-	Type MessageType
-	To   int
-	From int
-	Term int
-	/*	LogTerm          uint64      `protobuf:"varint,5,opt,name=logTerm" json:"logTerm"`
-		Index            uint64      `protobuf:"varint,6,opt,name=index" json:"index"`
-		Entries          []Entry     `protobuf:"bytes,7,rep,name=entries" json:"entries"`
-		Commit           uint64      `protobuf:"varint,8,opt,name=commit" json:"commit"`
+	Type       MessageType
+	From       int
+	To         int
+	Term       int
+	Entries    []Entry
+	Index      int
+	LogTerm    int
+	Commit     int
+	Reject     bool
+	RejectHint int
+	Snapshot   Snapshot
+	Context    []byte
+
+	/*
 		Snapshot         Snapshot    `protobuf:"bytes,9,opt,name=snapshot" json:"snapshot"`
-		Reject           bool        `protobuf:"varint,10,opt,name=reject" json:"reject"`
+
 		RejectHint       uint64      `protobuf:"varint,11,opt,name=rejectHint" json:"rejectHint"`
 		Context          []byte      `protobuf:"bytes,12,opt,name=context" json:"context,omitempty"`*/
 }
 
 func (m *Message) Reset() { *m = Message{} }
+func (m *Message) String() string {
+	return fmt.Sprintf("Message:Type:=[%s] From:=[%d], To:=[%d], Term:=[%d] Entries:=[%v] Index:=[%d] LogTerm:=[%d] Commit:=[%d] Reject:=[%t]", MessageType_name[m.Type], m.From, m.To, m.Term, m.Entries, m.Index, m.LogTerm, m.Commit, m.Reject)
+}
+func (m *Message) GetCommand() int {
+	cmd := 0
+	if len(m.Entries) > 0 {
+		str := string(m.Entries[0].Data[:])
+		cmd, _ = strconv.Atoi(str)
+	}
+	return cmd
+}
 
 // CampaignType represents the type of campaigning
 // the reason we use the type of string instead of uint64
@@ -92,3 +114,71 @@ const (
 	// campaignTransfer represents the type of leader transfer
 	campaignTransfer CampaignType = "CampaignTransfer"
 )
+
+type EntryType int
+
+const (
+	EntryNormal EntryType = iota
+	EntryConfChange
+)
+
+type Entry struct {
+	Type             EntryType
+	Term             int
+	Index            int
+	Data             []byte
+	XXX_unrecognized []byte
+}
+
+func (m *Entry) Reset() { *m = Entry{} }
+func (m *Entry) String() string {
+	return fmt.Sprintf("Entry:Term = [%d], Type = [%d], Index = [%d]", m.Term, m.Type, m.Index)
+}
+func (*Entry) ProtoMessage() {}
+
+type HardState struct {
+	Term             int
+	Vote             int
+	Commit           int
+	XXX_unrecognized []byte
+}
+
+func (m *HardState) Reset()      { *m = HardState{} }
+func (*HardState) ProtoMessage() {}
+func (m *HardState) String() string {
+	return fmt.Sprintf("HardState:Term = [%d], Vote = [%d], Commit = [%d]", m.Term, m.Vote, m.Commit)
+}
+
+type ConfState struct {
+	Nodes            []int
+	XXX_unrecognized []byte
+}
+
+func (m *ConfState) Reset()         { *m = ConfState{} }
+func (m *ConfState) String() string { return "confstate" }
+func (*ConfState) ProtoMessage()    {}
+
+type SnapshotMetadata struct {
+	ConfState        ConfState
+	Index            int
+	Term             int
+	XXX_unrecognized []byte
+}
+
+func (m *SnapshotMetadata) Reset() { *m = SnapshotMetadata{} }
+func (m *SnapshotMetadata) String() string {
+	return fmt.Sprintf("SnapshotMetadata:ConfState = [%v], Index = [%d], Term = [%d]", m.ConfState, m.Index, m.Term)
+}
+func (*SnapshotMetadata) ProtoMessage() {}
+
+type Snapshot struct {
+	Data             []byte
+	Metadata         SnapshotMetadata
+	XXX_unrecognized []byte
+}
+
+func (m *Snapshot) Reset() { *m = Snapshot{} }
+func (m *Snapshot) String() string {
+	return fmt.Sprintf("Snapshot:Metadata = [%v]", m.Metadata)
+}
+func (*Snapshot) ProtoMessage() {}

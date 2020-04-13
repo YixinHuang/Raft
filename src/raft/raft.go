@@ -1,6 +1,10 @@
+// Package raft : Version history
 // Version: 0.2
 // Date:2020/4/4
 // Memo: Main loop change ,refer to etct's raft code
+// Version: 0.3
+// Date:2020/4/6
+// Memo: Passed 2A: InitialElection2A & ReElection2A
 package raft
 
 // Package raft ...
@@ -23,6 +27,7 @@ package raft
 //
 
 import (
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -34,9 +39,10 @@ import (
 // import "bytes"
 // import "../labgob"
 
+//None :Default value TODO(hyx) 0?
 const None int = -1
 
-//
+// ApplyMsg :
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -53,7 +59,7 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
-//
+//RaftNodeState :
 //Server states. Followers only respond to requests from other servers.
 //If a follower receives no communication, it becomes a candidate and initiates an election.
 //A candidate that receives votes from a majority of the full cluster becomes the new leader.
@@ -82,13 +88,11 @@ var rnsmap = [...]string{
 	"Leader",
 }
 
-func (rns RaftNodeState) String() string {
-	return rnsmap[rns]
-}
+func (rns RaftNodeState) String() string { return rnsmap[rns] }
 
 type stepFunc func(r *Raft, m Message) error
 
-//
+// Raft :
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
@@ -105,20 +109,23 @@ type Raft struct {
 	//=========================State From Paper===================================
 	//Persistent state on all server：
 	//(Updated on stable storage before responding to RPCs)
-	currentTerm int                   //latest term server has seen.(initialized to 0 on first boot,increases monotonically)
-	votedFor    int                   //CandidateId that reveived vore in current term (or null if none)
-	logs        []map[int]interface{} //log entries;each entry contains command for state machine and term when entry was received by leader
+	currentTerm int //latest term server has seen.(initialized to 0 on first boot,increases monotonically)
+	votedFor    int //CandidateId that reveived vore in current term (or null if none)
+	//logs        []map[int]interface{} //log entries;each entry contains command for state machine and term when entry was received by leader
+	raftLog *raftLog
 
 	//Volatile state on all Servers：
 	commitIndex int //index of highest log entry known to be committed(initialized to 0, increases monotonically)
 	//A log entry is committed once the leader that created the entry has replicated it on a majority of the servers
+	//It includes commited index in future AppendEntries RPCs (including heartbeats) so that the other servers eventually ﬁnd out.
 
 	lastApplied int //index of highest log entry applied to state machine (initialized to 0,increases monotonically)
 	//Rules for all servers:If commitIndex > lastApplied: increment lastApplied, apply log[lastApplied] to state machine (§5.3) TBC
 
 	//Volatile state on leaders:(Reinitialized after election)
-	nextIndex  []int //for each server, index of the next log entry to send to that server(initialized to leader last log index +1)
-	matchIndex []int //for each server,index of highest entry known to be replicated on server(initialized to 0,increases monotonically)
+	//nextIndex  []int //for each server, index of the next log entry to send to that server(initialized to leader last log index +1)
+	//matchIndex []int //for each server,index of highest entry known to be replicated on server(initialized to 0,increases monotonically)
+	prs map[int]*Progress
 	//===========================================================================
 	//internal value declare here
 	nodeState RaftNodeState
@@ -137,12 +144,29 @@ type Raft struct {
 	votes   map[int]bool
 	elapsed int // number of ticks since the last msg
 	rand    *rand.Rand
+	msgs    []Message
 
 	//temp values fro kickoff
 	reStartHeartBeat bool
+
+	//applyCh is a channel on which the tester or service expects Raft to send ApplyMsg messages.
+	//Request by tesing codes
+	applyCh chan ApplyMsg
+
 	//Debug setting valuse
 	enableDump bool
+
+	//TODO(hyx) delete
+	tmpFlags bool
+	stopc    chan struct{} // signals proposal channel closed
 }
+
+/*
+fun (rf *Raft) templateFun(){
+	DPrintf("[templateFun@raft.go][%d] templateFun Start", rf.me)
+	DPrintf("[templateFun@raft.go][%d] templateFun Exit", rf.me)
+}
+*/
 
 func (rf *Raft) StartOfDay() {
 	DPrintf("[StartOfDay@raft.go][%d] StartOfDay Start", rf.me)
@@ -155,6 +179,12 @@ func (rf *Raft) StartOfDay() {
 	rf.ChangeNodeState(follower)
 	rf.rand = rand.New(rand.NewSource(time.Now().Unix() + int64(rf.me)))
 
+	rf.prs = make(map[int]*Progress)
+
+	for i, _ := range rf.peers {
+		rf.prs[i] = &Progress{Next: 1}
+	}
+
 	DPrintf("[StartOfDay@raft.go][%d] StartOfDay Exit", rf.me)
 }
 
@@ -162,6 +192,8 @@ func (rf *Raft) SetCurrentTerm(term int) {
 	rf.currentTerm = term
 	DPrintf("[SetCurrentTerm@raft.go][%d] rf.currentTerm:=[%d]", rf.me, rf.currentTerm)
 }
+
+func (rf *Raft) majority() int { return len(rf.peers)/2 + 1 }
 
 func (rf *Raft) PlusCurrentTerm() {
 	rf.currentTerm++
@@ -253,41 +285,42 @@ func (rf *Raft) DumpRaft() {
 		DPrintf("[DumpRaft@raft.go] rf.nodeState:= leader")
 	default:
 		DPrintf("[DumpRaft@raft.go] rf.nodeState:= N/A")
-
 	}
-	for i, nxtInd := range rf.nextIndex {
-		DPrintf("[DumpRaft@raft.go] rf.nextIndex[%d] := [%d]", i, nxtInd)
-	}
-
-	for i, mchInd := range rf.matchIndex {
-		DPrintf("[DumpRaft@raft.go] rf.matchIndex[%d] := [%d]", i, mchInd)
+	//Dump Progress
+	for i, curprs := range rf.prs {
+		DPrintf("[DumpRaft@raft.go] rf.prs[%d] := [%v]", i, curprs)
 	}
 
 	for i, voterlt := range rf.votes {
 		DPrintf("[DumpRaft@raft.go] rf.votes[%d] := [%t]", i, voterlt)
 	}
+	for i, msg := range rf.msgs {
+		DPrintf("[DumpRaft@raft.go] rf.msgs[%d] := [%s]", i, msg.String())
+	}
+	DPrintf("[DumpRaft@raft.go] rf.raftLog := [%v]", rf.raftLog)
 
 	DPrintf("[DumpRaft@raft.go] ---------------------------------------------------------------------------------")
 }
 
 //-------------copy from etcd-------------------------------
 
-func (r *Raft) reset(term int) {
-	if r.currentTerm != term {
-		r.SetCurrentTerm(term)
-		r.votedFor = None
+func (rf *Raft) reset(term int) {
+	if rf.currentTerm != term {
+		rf.SetCurrentTerm(term)
+		rf.votedFor = None
 	}
-	r.SetLeader(None)
-	r.SetElapsed(0)
-	r.votes = make(map[int]bool)
-	r.reStartHeartBeat = false
+	rf.SetLeader(None)
+	rf.SetElapsed(0)
+	rf.votes = make(map[int]bool)
+	rf.reStartHeartBeat = false
 
 	//debuging initialize values
 	//rf.enableDump = false
-	r.enableDump = true
+	rf.enableDump = true
+	rf.tmpFlags = true
 }
 
-// isElectionTimeout returns true if r.elapsed is greater than the
+// isElectionTimeout returns true if rf.elapsed is greater than the
 // randomized election timeout in (electiontimeout, 2 * electiontimeout - 1).
 // Otherwise, it returns false.
 func (rf *Raft) isElectionTimeout() bool {
@@ -297,13 +330,14 @@ func (rf *Raft) isElectionTimeout() bool {
 	}
 	dif := rf.rand.Int() % rf.electionTimeout
 	if d > dif {
-		DPrintf("[isElectionTimeout@raft.go][%d] return ture , because d[%d] > deff[%d], r.elapsed=[%d]", rf.me, d, dif, rf.elapsed)
+		DPrintf("[isElectionTimeout@raft.go][%d] return ture , because d[%d] > deff[%d], rf.elapsed=[%d]", rf.me, d, dif, rf.elapsed)
 		return true
 	} else {
 		return false
 	}
 }
 
+// GetState :
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -357,6 +391,15 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+}
+
+func (rf *Raft) softState() *SoftState { return &SoftState{Lead: rf.lead, RaftState: rf.nodeState} }
+func (rf *Raft) hardState() HardState {
+	return HardState{
+		Term:   rf.currentTerm,
+		Vote:   rf.votedFor,
+		Commit: rf.raftLog.committed,
+	}
 }
 
 //============================RequestVote RPC==================================
@@ -495,16 +538,26 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 //
 type AppendEntriesArgs struct {
 	// Your data here (2A, 2B).
-	Term         int //leader's term
-	LeaderId     int //so follower can redirect clients
-	PrevLogIndex int //index of logentry immediately preceding new ones
-	PrevLogTerm  int //term of PrevLogIndex  entry
-	//entries		 []int //log entries to store(empty for heartbeat;may send more than one for efficiency)
-	LeaderCommit int //leader's commitIndex
+	Term         int     //leader's term
+	LeaderId     int     //so follower can redirect clients
+	PrevLogIndex int     //index of logentry immediately preceding new ones
+	PrevLogTerm  int     //term of PrevLogIndex  entry
+	Entries      []Entry ////log entries to store(empty for heartbeat;may send more than one for efficiency)
+	LeaderCommit int     //leader's commitIndex
+	//----hack
+	Msg Message
 }
 
 func (req *AppendEntriesArgs) DumpAppendEntriesArgs() {
-	DPrintf("[DumpAppendEntriesArgs@raft.go] req.Term := [%d] req.LeaderId :=[%d]  req.PrevLogIndex :=[%d] req.PrevLogTerm :=[%d] req.LeaderCommit :=[%d]", req.Term, req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, req.LeaderCommit)
+	DPrintf("[DumpAppendEntriesArgs@raft.go] req.Term := [%d] req.LeaderId :=[%d]  req.PrevLogIndex :=[%d] req.PrevLogTerm :=[%d] req.LeaderCommit :=[%d] req.Entries :=[]", req.Term, req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, req.LeaderCommit)
+}
+
+func (req *AppendEntriesArgs) String() string {
+	rtEs := ""
+	for _, e := range req.Entries {
+		rtEs = rtEs + e.String()
+	}
+	return fmt.Sprintf("[DumpAppendEntriesArgs@raft.go] req.Term := [%d] req.LeaderId :=[%d]  req.PrevLogIndex :=[%d] req.PrevLogTerm :=[%d] req.LeaderCommit :=[%d] Entries:=[%s]", req.Term, req.LeaderId, req.PrevLogIndex, req.PrevLogTerm, req.LeaderCommit, rtEs)
 }
 
 //
@@ -588,12 +641,52 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := false
 
 	// Your code here (2B).
-	DPrintf("[Start@raft.go] Start() Entry")
-	index = rf.commitIndex
-	term = rf.currentTerm
+	DPrintf("[Start@raft.go][%d][%s] Start() Entry", rf.me, rf.GetNodeState())
 	isLeader = rf.IsLeader()
-	DPrintf("[Start@raft.go] Start() Exit. index:=[%d] term:=[%d] isLeader:=[%t]", index, term, isLeader)
+
+	//Test demo Start
+	if isLeader {
+		rf.saveCommand2Raftlog(command)
+		//rf.sendApplyMsg(command)
+	} /*else {
+		rf.answer2tesingSvr(100)
+	}*/
+	//Test demo End
+
+	index = rf.prs[rf.lead].Match + 1 //TODO rf.commitIndex
+	term = rf.currentTerm
+
+	DPrintf("[Start@raft.go][%d][%s] Start() Exit. index:=[%d] term:=[%d] isLeader:=[%t]", rf.me, rf.GetNodeState(), index, term, isLeader)
 	return index, term, isLeader
+}
+
+func (rf *Raft) sendApplyMsg(command interface{}) {
+
+	DPrintf("[sendApplyMsg@raft.go2B][%d] sendApplyMsg Start,command:=[%v]", rf.me, command)
+	rf.commitIndex = 1
+	applyMsg := ApplyMsg{
+		CommandValid: true,
+		Command:      command,
+		CommandIndex: rf.prs[rf.lead].Match,
+	}
+	rf.applyCh <- applyMsg
+	DPrintf("[sendApplyMsg@raft.go2B][%d] sendApplyMsg Exit,CommandValid:=[%t] command:=[%v] CommandIndex:=[%d]", rf.me, applyMsg.CommandValid, applyMsg.Command, applyMsg.CommandIndex)
+
+}
+
+func (rf *Raft) answer2tesingSvr(command interface{}, index int) {
+	DPrintf("[answer2tesingSvr@raft.go2B][%d][%s] answer2tesingSvr Entry,command:=[%v]  index:=[%d]", rf.me, rf.GetNodeState(), command, index)
+
+	rf.tmpFlags = false
+	rf.commitIndex = 1
+	applyMsg := ApplyMsg{
+		CommandValid: true,
+		Command:      command,
+		CommandIndex: index + 1, //rf.prs[rf.lead].Match + 1,
+	}
+	rf.applyCh <- applyMsg
+
+	DPrintf("[answer2tesingSvr@raft.go2B][%d][%s] sanswer2tesingSvrendApplyMsg Exit,command:=[%v] CommandIndex:=[%d]", rf.me, rf.GetNodeState(), command, applyMsg.CommandIndex)
 }
 
 //
@@ -610,6 +703,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	DPrintf("[Kill@raft.go][%d]Kill Entry", rf.me)
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.stopc <- struct{}{}
 	DPrintf("[Kill@raft.go][%d]Kill Exit", rf.me)
 	// Your code here, if desired.
 }
@@ -619,7 +713,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-//
+// Make :
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -640,6 +734,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	DPrintf("[Make@raft.go][%d] StartOfDay initialized", rf.me)
+	rf.applyCh = applyCh
 	rf.StartOfDay()
 
 	rf.heartbeatTimeout = 2
@@ -648,16 +743,20 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	//TODO(hyx): Need work with persister
+	rf.raftLog = newLog(NewMemoryStorage())
+	DPrintf("[Make@raft.go][%d] raftlog:=[%v]", rf.me, rf.raftLog)
+
 	//Modify Make() to create a background goroutine that will kick off leader election periodically by
 	//sending out RequestVote RPCs when it hasn't heard from another peer for a while.
 	//This way a peer will learn who is the leader, if there is already a leader, or become the leader itself.
 	//Implement the RequestVote() RPC handler so that servers will vote for one another.
-	var command interface{}
-	rf.Start(command)
+	//var command interface{}
+	//rf.Start(command)
 
 	//Refre the etcd example code ,the newRaftNode() initiates a raftnode instance
 	//The raftnode has a member named node (node.go),and the node had raft instance
-	newRaftNode(rf)
+	rf.stopc = newRaftNode(rf)
 
 	//kickoff is simple implementation for testing case
 	//go rf.kickoff()
@@ -807,16 +906,15 @@ func (rf *Raft) SendReqVote2All() {
 		}(i)
 	}
 	// Need using peer total number to count
-	majority := len(rf.peers)/2 + 1
-	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, majority)
+	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, rf.majority())
 
 	mu.Lock()
-	for votesCount < majority && finishedLoop != majority+1 {
+	for votesCount < rf.majority() && finishedLoop != rf.majority()+1 {
 		DPrintf("[SendReqVote2All@raft.go][%d] cond.Wait()  votesCount=[%d] finishedLoop=[%d]", rf.me, votesCount, finishedLoop)
 		cond.Wait()
 	}
 
-	if votesCount >= majority {
+	if votesCount >= rf.majority() {
 		mu.Unlock()
 		rf.ChangeNodeState(leader)
 		rf.SetLeader(rf.me)
@@ -844,7 +942,7 @@ func (rf *Raft) SendAppendEntries2All() {
 		peername := curPeer.GetName()
 		go func(server int) {
 			DPrintf("[SendAppendEntries2All@raft.go][%d][%s] send AppendEntries for  rf.peers[%d] := [%s]", rf.me, rf.GetNodeState(), server, peername)
-			args := AppendEntriesArgs{rf.currentTerm, rf.me, rf.lastApplied, rf.GetLastLogTerm(), rf.commitIndex}
+			args := AppendEntriesArgs{Term: rf.currentTerm, LeaderId: rf.me, PrevLogIndex: rf.lastApplied, PrevLogTerm: rf.GetLastLogTerm(), LeaderCommit: rf.commitIndex}
 			reply := AppendEntriesReply{}
 			//DPrintf("[SendAppendEntries2All@raft.go][%d] Call AppendEntries Entry", rf.me)
 			rf.sendAppendEntries(server, &args, &reply)
@@ -914,10 +1012,9 @@ func (rf *Raft) SendReqVote2AllVerWaitGroup() {
 	wg.Wait() //need update here
 
 	// Need using peer total number to count
-	majority := len(rf.peers)/2 + 1
-	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, majority)
+	DPrintf("[SendReqVote2All@raft.go][%d] majority:=[%d]", rf.me, rf.majority())
 
-	if votesCount >= majority {
+	if votesCount >= rf.majority() {
 		rf.ChangeNodeState(leader)
 		DPrintf("[SendReqVote2All@raft.go][%d][%s] ChangeNodeState to leader because total votesCount:=[%d]", rf.me, rf.GetNodeState(), votesCount)
 		rf.SendAppendEntries2All()
